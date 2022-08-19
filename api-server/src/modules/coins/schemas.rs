@@ -5,6 +5,7 @@ pub struct SendTransferRequest {
     // XXX
     pub transfer_amount: crate::integers::U128,
     pub sender_seed_phrase: bip39::Mnemonic,
+    pub sender_account_id: Option<near_primitives::types::AccountId>,
     pub receiver_account_id: near_primitives::types::AccountId,
 }
 

@@ -4,7 +4,7 @@ use actix_web::web;
 
 pub async fn send_transfer(
     rpc_client: web::Data<near_jsonrpc_client::JsonRpcClient>,
-    request: web::Json<super::schemas::SendTransferRequest>,
+    web::Json(request): web::Json<super::schemas::SendTransferRequest>,
 ) -> crate::Result<web::Json<super::schemas::SendTransferResponse>> {
     let derived_private_key = slip10::derive_key_from_path(
         &request.sender_seed_phrase.to_seed(""),
@@ -24,20 +24,52 @@ pub async fn send_transfer(
         ed25519_dalek::Keypair { secret, public }
     };
 
-    let sender_implicit_account_id =
-        near_primitives::types::AccountId::try_from(hex::encode(&secret_keypair.public))?;
+    let sender_account_id = if let Some(sender_account_id) = request.sender_account_id {
+        let request = near_jsonrpc_client::methods::query::RpcQueryRequest {
+            block_reference: near_primitives::types::Finality::Final.into(),
+            request: near_primitives::views::QueryRequest::ViewAccessKey {
+                account_id: sender_account_id.clone(),
+                public_key: near_crypto::ED25519PublicKey::from(
+                    secret_keypair.public.clone().to_bytes(),
+                )
+                .into(),
+            },
+        };
+
+        let response = rpc_client.call(request).await?;
+
+        if let near_jsonrpc_primitives::types::query::QueryResponseKind::AccessKey(_) =
+            response.kind
+        {
+            sender_account_id
+        } else {
+            return Err(crate::errors::ErrorKind::InvalidInput(format!(
+                "The sender_seed_phrase does not match any access key on the {} account",
+                sender_account_id
+            ))
+            .into());
+        }
+    } else {
+        near_primitives::types::AccountId::try_from(hex::encode(&secret_keypair.public))?
+    };
 
     // TODO: check if balance available
 
-    let signer_secret_key = std::env::var("CASTODIAL_SIGNER_SECRET_KEY").expect("CASTODIAL_SIGNER_SECRET_KEY environment variable is not provided").parse().unwrap();
+    let signer_secret_key = std::env::var("CASTODIAL_SIGNER_SECRET_KEY")
+        .expect("CASTODIAL_SIGNER_SECRET_KEY environment variable is not provided")
+        .parse()
+        .unwrap();
     let signer = near_crypto::InMemorySigner::from_secret_key(
-        std::env::var("CASTODIAL_SIGNER_ACCOUNT_ID").expect("CASTODIAL_SIGNER_ACCOUNT_ID environment variable is not provided").parse().unwrap(),
+        std::env::var("CASTODIAL_SIGNER_ACCOUNT_ID")
+            .expect("CASTODIAL_SIGNER_ACCOUNT_ID environment variable is not provided")
+            .parse()
+            .unwrap(),
         signer_secret_key,
     );
 
     let access_key_query_response = rpc_client
         .call(near_jsonrpc_client::methods::query::RpcQueryRequest {
-            block_reference: near_primitives::types::BlockReference::latest(),
+            block_reference: near_primitives::types::Finality::Final.into(),
             request: near_primitives::views::QueryRequest::ViewAccessKey {
                 account_id: signer.account_id.clone(),
                 public_key: signer.public_key.clone(),
@@ -62,7 +94,7 @@ pub async fn send_transfer(
             near_primitives::transaction::FunctionCallAction {
                 method_name: "custodial_ft_transfer".to_string(),
                 args: serde_json::json!({
-                    "sender_id": sender_implicit_account_id.to_string(),
+                    "sender_id": sender_account_id.to_string(),
                     "receiver_id": request.receiver_account_id.to_string(),
                     "amount": request.transfer_amount,
                 })
