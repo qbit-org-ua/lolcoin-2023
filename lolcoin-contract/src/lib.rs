@@ -15,15 +15,26 @@ NOTES:
   - To prevent the deployed contract from being modified or deleted, it should not have any access
     keys on its account.
 */
-use near_contract_standards::fungible_token::metadata::{
-    FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC,
+use near_contract_standards::storage_management::{
+    StorageBalance, StorageBalanceBounds, StorageManagement,
 };
-use near_contract_standards::fungible_token::FungibleToken;
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::collections::LazyOption;
 use near_sdk::json_types::U128;
 use near_sdk::serde::{Deserialize, Serialize};
-use near_sdk::{log, near_bindgen, AccountId, Balance, PanicOnDefault, PromiseOrValue};
+use near_sdk::{log, near_bindgen, AccountId, PanicOnDefault, PromiseOrValue};
+
+use crate::fungible_token::core::FungibleTokenCore;
+use crate::fungible_token::metadata::{
+    FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC,
+};
+use crate::fungible_token::resolver::FungibleTokenResolver;
+use crate::fungible_token::FungibleToken;
+
+/// Contains a fork of fungible token standard implementation from near-sdk-rs to support iteration
+/// over accounts (use UnorderedMap instead of LookupMap).
+/// https://github.com/near/near-sdk-rs/tree/de975ed75e0f6a840c7aeb57e3414959cb59bc00/near-contract-standards/src/fungible_token
+mod fungible_token;
 
 mod internal;
 
@@ -92,11 +103,20 @@ impl Contract {
         });
     }
 
+    #[private]
+    pub fn reset_state() {
+        near_sdk::env::state_write(&Self::new_default_meta(std::collections::HashSet::from([
+            "lolcoin.qbit.near".parse().unwrap(),
+            "qbit.near".parse().unwrap(),
+            "frol.near".parse().unwrap(),
+        ])));
+    }
+
     pub fn reward(&mut self, rewards: Vec<Reward>, memo: Option<String>) {
         self.assert_reward_operator();
         let mut events = vec![];
         for reward in &rewards {
-            if !self.token.accounts.contains_key(&reward.target_account_id) {
+            if self.token.accounts.get(&reward.target_account_id).is_none() {
                 self.token
                     .internal_register_account(&reward.target_account_id);
             }
@@ -123,17 +143,96 @@ impl Contract {
             .internal_transfer(&sender_id, &receiver_id, amount.into(), memo);
     }
 
-    fn on_account_closed(&mut self, account_id: AccountId, balance: Balance) {
-        log!("Closed @{} with {}", account_id, balance);
-    }
-
-    fn on_tokens_burned(&mut self, account_id: AccountId, amount: Balance) {
-        log!("Account @{} burned {}", account_id, amount);
+    pub fn ft_balances(&self) -> Vec<(AccountId, U128)> {
+        self.token
+            .accounts
+            .iter()
+            .map(|(k, v)| (k, v.into()))
+            .collect()
     }
 }
 
-near_contract_standards::impl_fungible_token_core!(Contract, token, on_tokens_burned);
-near_contract_standards::impl_fungible_token_storage!(Contract, token, on_account_closed);
+#[near_bindgen]
+impl FungibleTokenCore for Contract {
+    #[payable]
+    fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>) {
+        self.token.ft_transfer(receiver_id, amount, memo)
+    }
+
+    #[payable]
+    fn ft_transfer_call(
+        &mut self,
+        receiver_id: AccountId,
+        amount: U128,
+        memo: Option<String>,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        self.token.ft_transfer_call(receiver_id, amount, memo, msg)
+    }
+
+    fn ft_total_supply(&self) -> U128 {
+        self.token.ft_total_supply()
+    }
+
+    fn ft_balance_of(&self, account_id: AccountId) -> U128 {
+        self.token.ft_balance_of(account_id)
+    }
+}
+
+#[near_bindgen]
+impl FungibleTokenResolver for Contract {
+    #[private]
+    fn ft_resolve_transfer(
+        &mut self,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> U128 {
+        let (used_amount, burned_amount) =
+            self.token
+                .internal_ft_resolve_transfer(&sender_id, receiver_id, amount);
+        if burned_amount > 0 {
+            log!("Account @{} burned {}", sender_id, burned_amount);
+        }
+        used_amount.into()
+    }
+}
+
+#[near_bindgen]
+impl StorageManagement for Contract {
+    #[payable]
+    fn storage_deposit(
+        &mut self,
+        account_id: Option<AccountId>,
+        registration_only: Option<bool>,
+    ) -> StorageBalance {
+        self.token.storage_deposit(account_id, registration_only)
+    }
+
+    #[payable]
+    fn storage_withdraw(&mut self, amount: Option<U128>) -> StorageBalance {
+        self.token.storage_withdraw(amount)
+    }
+
+    #[payable]
+    fn storage_unregister(&mut self, force: Option<bool>) -> bool {
+        #[allow(unused_variables)]
+        if let Some((account_id, balance)) = self.token.internal_storage_unregister(force) {
+            log!("Closed @{} with {}", account_id, balance);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn storage_balance_bounds(&self) -> StorageBalanceBounds {
+        self.token.storage_balance_bounds()
+    }
+
+    fn storage_balance_of(&self, account_id: AccountId) -> Option<StorageBalance> {
+        self.token.storage_balance_of(account_id)
+    }
+}
 
 #[near_bindgen]
 impl FungibleTokenMetadataProvider for Contract {
@@ -150,7 +249,7 @@ mod tests {
 
     use super::*;
 
-    const TOTAL_SUPPLY: Balance = 1_000_000_000_000_000;
+    const TOTAL_SUPPLY: Balance = 0;
 
     fn get_context(predecessor_account_id: AccountId) -> VMContextBuilder {
         let mut builder = VMContextBuilder::new();
@@ -165,7 +264,8 @@ mod tests {
     fn test_new() {
         let mut context = get_context(accounts(1));
         testing_env!(context.build());
-        let contract = Contract::new_default_meta(accounts(1).into(), TOTAL_SUPPLY.into());
+        let contract =
+            Contract::new_default_meta(std::collections::HashSet::from([accounts(1).into()]));
         testing_env!(context.is_view(true).build());
         assert_eq!(contract.ft_total_supply().0, TOTAL_SUPPLY);
         assert_eq!(contract.ft_balance_of(accounts(1)).0, TOTAL_SUPPLY);
@@ -183,9 +283,10 @@ mod tests {
     fn test_transfer() {
         let mut context = get_context(accounts(2));
         testing_env!(context.build());
-        let mut contract = Contract::new_default_meta(accounts(2).into(), TOTAL_SUPPLY.into());
+        let mut contract =
+            Contract::new_default_meta(std::collections::HashSet::from([accounts(2).into()]));
         testing_env!(context
-            .storage_usage(env::storage_usage())
+            .storage_usage(near_sdk::env::storage_usage())
             .attached_deposit(contract.storage_balance_bounds().min.into())
             .predecessor_account_id(accounts(1))
             .build());
@@ -193,23 +294,42 @@ mod tests {
         contract.storage_deposit(None, None);
 
         testing_env!(context
-            .storage_usage(env::storage_usage())
+            .storage_usage(near_sdk::env::storage_usage())
             .attached_deposit(1)
             .predecessor_account_id(accounts(2))
             .build());
-        let transfer_amount = TOTAL_SUPPLY / 3;
+        let transfer_amount = 1_000;
+        contract.reward(
+            vec![Reward {
+                target_account_id: accounts(2),
+                tokens_amount: transfer_amount.into(),
+                memo: None,
+            }],
+            None,
+        );
+
+        testing_env!(context
+            .storage_usage(near_sdk::env::storage_usage())
+            .attached_deposit(1)
+            .predecessor_account_id(accounts(2))
+            .build());
+        let transfer_amount = 1_000;
         contract.ft_transfer(accounts(1), transfer_amount.into(), None);
 
         testing_env!(context
-            .storage_usage(env::storage_usage())
-            .account_balance(env::account_balance())
+            .storage_usage(near_sdk::env::storage_usage())
+            .account_balance(near_sdk::env::account_balance())
             .is_view(true)
             .attached_deposit(0)
             .build());
-        assert_eq!(
-            contract.ft_balance_of(accounts(2)).0,
-            (TOTAL_SUPPLY - transfer_amount)
-        );
+        assert_eq!(contract.ft_balance_of(accounts(2)).0, 0);
         assert_eq!(contract.ft_balance_of(accounts(1)).0, transfer_amount);
+        assert_eq!(
+            contract.ft_balances(),
+            vec![
+                (accounts(1), transfer_amount.into()),
+                (accounts(2), 0.into()),
+            ]
+        );
     }
 }
