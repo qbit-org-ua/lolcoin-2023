@@ -180,6 +180,11 @@ impl Contract {
         );
         self.tokens_on_sale.insert(&token_id, &price.into());
     }
+
+    #[private]
+    pub fn refund(&mut self, refund: U128) -> U128 {
+        refund
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -235,8 +240,12 @@ impl FungibleTokenReceiver for Contract {
                     .remove(&token_id) else {
                         near_sdk::env::panic_str("Token is not for sale");
                     };
-                require!(deposit >= token_price, "Not enough funds");
+                require!(
+                    deposit >= token_price,
+                    "Deposit cannot be less than the token price"
+                );
                 let token_current_owner = self.tokens.owner_by_id.get(&token_id).unwrap();
+                let refund = deposit - token_price;
                 self.tokens.internal_transfer(
                     &token_current_owner,
                     &sender_id,
@@ -247,9 +256,10 @@ impl FungibleTokenReceiver for Contract {
                 near_contract_standards::fungible_token::core::ext_ft_core::ext(
                     near_sdk::env::predecessor_account_id(),
                 )
-                .ft_transfer(token_current_owner, token_price.into(), None);
-                let refund = deposit - token_price;
-                PromiseOrValue::Value(U128::from(refund))
+                .with_attached_deposit(1)
+                .ft_transfer(token_current_owner, token_price.into(), None)
+                .then(Self::ext(env::current_account_id()).refund(U128::from(refund)))
+                .into()
             }
         }
     }
